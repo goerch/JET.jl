@@ -423,7 +423,7 @@ function _virtual_process!(s::AbstractString,
 
     toplevelex = parse_input_line(s; filename)
 
-    if @isexpr(toplevelex, (:error, :incomplete))
+    if isexpr(toplevelex, (:error, :incomplete))
         # if there's any syntax error, try to identify all the syntax error location
         append!(res.toplevel_error_reports, collect_syntax_errors(s, filename))
     elseif isnothing(toplevelex)
@@ -446,8 +446,9 @@ function _virtual_process!(toplevelex::Expr,
                            config::ToplevelConfig,
                            context::Module,
                            res::VirtualProcessResult,
+                           force_concretize::Bool = false,
                            )
-    @assert @isexpr(toplevelex, :toplevel)
+    @assert isexpr(toplevelex, :toplevel)
 
     local lnn::LineNumberNode = LineNumberNode(0, filename)
 
@@ -488,7 +489,7 @@ function _virtual_process!(toplevelex::Expr,
         lwr = lower(mod, x)
 
         # here we should capture syntax errors found during lowering
-        if @isexpr(lwr, :error)
+        if isexpr(lwr, :error)
             msg = first(lwr.args)
             push!(res.toplevel_error_reports, SyntaxErrorReport("syntax: $msg", filename, lnn.line))
             return nothing
@@ -499,9 +500,9 @@ function _virtual_process!(toplevelex::Expr,
 
     # transform, and then analyze sequentially
     # IDEA the following code has some of duplicated work with `JuliaInterpreter.ExprSpliter` and we may want to factor them out
-    exs = reverse(toplevelex.args)
+    exs = push_vex_stack!(VExpr[], toplevelex, force_concretize)
     while !isempty(exs)
-        x = pop!(exs)
+        (; x, force_concretize) = pop!(exs)
 
         # with_toplevel_logger(analyzer, ≥(DEBUG_LOGGER_LEVEL)) do @nospecialize(io)
         #     println(io, "analyzing ", x)
@@ -518,43 +519,21 @@ function _virtual_process!(toplevelex::Expr,
         # patterns matches `x`, JET just concretizes everything involved with it
         # since patterns are expected to work on surface level AST, we should configure it
         # here before macro expansion and lowering
-        local force_concretize = false
         for pat in config.concretization_patterns
             if @capture(x, $pat)
-                force_concretize = true
                 with_toplevel_logger(analyzer, ≥(DEBUG_LOGGER_LEVEL)) do @nospecialize(io)
                     line, file = lnn.line, lnn.file
                     x′ = striplines(normalise(x))
                     println(io, "concretization pattern `$pat` matched `$x′` at $file:$line")
                 end
-
-                blk = Expr(:block, lnn, x) # attach current line number info
-                lwr = lower_with_err_handling(context, blk)
-
-                isnothing(lwr) && break # error happened during lowering
-                @isexpr(lwr, :thunk) || break # literal
-
-                src = first((lwr::Expr).args)::CodeInfo
-
-                fix_self_references!(res.actual2virtual, src)
-
-                interp = ConcreteInterpreter(filename,
-                                             lnn,
-                                             eval_with_err_handling,
-                                             context,
-                                             analyzer,
-                                             config,
-                                             res,
-                                             )
-                JuliaInterpreter.finish!(interp, Frame(context, src), true)
+                force_concretize = true
                 break
             end
         end
-        force_concretize && continue
 
         # we will end up lowering `x` later, but special case `macrocall`s and expand it here
         # this is because macros can arbitrarily generate `:toplevel` and `:module` expressions
-        if @isexpr(x, :macrocall)
+        if isexpr(x, :macrocall)
             newx = macroexpand_with_err_handling(context, x)
 
             # if any error happened during macro expansion, bail out now and continue
@@ -566,18 +545,18 @@ function _virtual_process!(toplevelex::Expr,
             if first(x.args) === GlobalRef(Core, Symbol("@doc"))
                 # `@doc` macro usually produces :block expression, but may also produce :toplevel
                 # one when attached to a module expression
-                @assert @isexpr(newx, :block) || @isexpr(newx, :toplevel)
-                append!(exs, reverse!((newx::Expr).args))
+                @assert isexpr(newx, :block) || isexpr(newx, :toplevel)
+                push_vex_stack!(exs, newx::Expr, force_concretize)
             else
-                push!(exs, newx)
+                push!(exs, VExpr(newx, force_concretize))
             end
 
             continue
         end
 
         # flatten container expression
-        if @isexpr(x, :toplevel)
-            append!(exs, reverse(x.args))
+        if isexpr(x, :toplevel)
+            push_vex_stack!(exs, x, force_concretize)
             continue
         end
 
@@ -586,9 +565,9 @@ function _virtual_process!(toplevelex::Expr,
         # "toplevel definitions" inside of the loaded modules shouldn't be evaluated in a
         # context of `context` module
 
-        if @isexpr(x, :module)
+        if isexpr(x, :module)
             newblk = x.args[3]
-            @assert @isexpr(newblk, :block)
+            @assert isexpr(newblk, :block)
             newtoplevelex = Expr(:toplevel, newblk.args...)
 
             x.args[3] = Expr(:block) # empty module's code body
@@ -598,13 +577,13 @@ function _virtual_process!(toplevelex::Expr,
 
             newmod = newcontext::Module
             push!(res.defined_modules, newmod)
-            _virtual_process!(newtoplevelex, filename, analyzer, config, newmod, res)
+            _virtual_process!(newtoplevelex, filename, analyzer, config, newmod, res, force_concretize)
 
             continue
         end
 
         # can't wrap `:global` declaration into a block
-        if @isexpr(x, :global)
+        if isexpr(x, :global)
             eval_with_err_handling(context, x)
             continue
         end
@@ -613,7 +592,7 @@ function _virtual_process!(toplevelex::Expr,
         lwr = lower_with_err_handling(context, blk)
 
         isnothing(lwr) && continue # error happened during lowering
-        @isexpr(lwr, :thunk) || continue # literal
+        isexpr(lwr, :thunk) || continue # literal
 
         src = first((lwr::Expr).args)::CodeInfo
 
@@ -627,6 +606,10 @@ function _virtual_process!(toplevelex::Expr,
                                      config,
                                      res,
                                      )
+        if force_concretize
+            JuliaInterpreter.finish!(interp, Frame(context, src), true)
+            continue
+        end
         concretized = partially_interpret!(interp, context, src)
 
         # bail out if nothing to analyze (just a performance optimization)
@@ -640,6 +623,20 @@ function _virtual_process!(toplevelex::Expr,
     end
 
     return res
+end
+
+struct VExpr
+    x
+    force_concretize::Bool
+    VExpr(@nospecialize(x), force_concretize::Bool) = new(x, force_concretize)
+end
+
+function push_vex_stack!(exs::Vector{VExpr}, newex::Expr, force_concretize::Bool)
+    nargs = length(newex.args)
+    for i in 0:(nargs-1)
+        push!(exs, VExpr(newex.args[nargs-i], force_concretize))
+    end
+    return exs
 end
 
 split_module_path(::Type{String}, m::Module) = split(string(m), '.')
@@ -798,6 +795,7 @@ function partially_interpret!(interp::ConcreteInterpreter, mod::Module, src::Cod
 
     # NOTE if `JuliaInterpreter.optimize!` may modify `src`, `src` and `concretize` can be inconsistent
     # here we create `JuliaInterpreter.Frame` by ourselves disabling the optimization (#277)
+    # TODO: change to a better Frame constructor when available
     framecode = JuliaInterpreter.FrameCode(mod, src, optimize=false)
     @assert length(framecode.src.code) == length(concretize)
     frame = Frame(framecode, JuliaInterpreter.prepare_framedata(framecode, Any[]))
@@ -831,11 +829,11 @@ function select_direct_requirement!(concretize, stmts, edges)
             continue
         end
 
-        if @isexpr(stmt, :(=))
+        if isexpr(stmt, :(=))
             lhs, rhs = stmt.args
             stmt = rhs
         end
-        if @isexpr(stmt, :call)
+        if isexpr(stmt, :call)
             f = stmt.args[1]
 
             # special case `include` calls
@@ -976,7 +974,7 @@ function JuliaInterpreter.step_expr!(interp::ConcreteInterpreter, frame::Frame, 
 end
 
 function collect_toplevel_signature!(interp::ConcreteInterpreter, frame::Frame, @nospecialize(node))
-    if @isexpr(node, :method, 3)
+    if isexpr(node, :method, 3)
         sigs = node.args[2]
         atype_params, sparams, _ = @lookup(moduleof(frame), frame, sigs)::SimpleVector
         # t = atype_params[1]
@@ -989,7 +987,7 @@ function collect_toplevel_signature!(interp::ConcreteInterpreter, frame::Frame, 
     end
 end
 
-ismoduleusage(@nospecialize(x)) = @isexpr(x, (:import, :using, :export))
+ismoduleusage(@nospecialize(x)) = isexpr(x, (:import, :using, :export))
 
 # assuming `ismoduleusage(x)` holds
 function to_simple_module_usages(x::Expr)
@@ -1011,7 +1009,7 @@ function to_simple_module_usages(x::Expr)
                 return [x]
             else
                 # using A: sym1, sym2, ...
-                @assert @isexpr(arg, :(:))
+                @assert isexpr(arg, :(:))
                 a, as... = arg.args
                 return Expr.(x.head, Expr.(arg.head, Ref(a), as))::Vector{Expr}
             end
@@ -1158,8 +1156,8 @@ function collect_syntax_errors(s, filename)
             !isnothing(ex)
         end
         line += count(==('\n'), s[index:nextindex-1])
-        report = @isexpr(ex, :error) ? SyntaxErrorReport(string("syntax: ", first(ex.args)), filename, line) :
-                 @isexpr(ex, :incomplete) ? SyntaxErrorReport(first(ex.args), filename, line) :
+        report = isexpr(ex, :error) ? SyntaxErrorReport(string("syntax: ", first(ex.args)), filename, line) :
+                 isexpr(ex, :incomplete) ? SyntaxErrorReport(first(ex.args), filename, line) :
                  nothing
         isnothing(report) || push!(reports, report)
         index = nextindex
