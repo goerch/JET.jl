@@ -193,7 +193,7 @@ end
     end
 end
 
-@testset "\"toplevel definitions\"" begin
+@testset "'toplevel definitions'" begin
     let
         vmod, = @analyze_toplevel2 begin
             # function
@@ -287,41 +287,80 @@ end
         @test is_abstract(vmod, :uc)
     end
 
-    # a toplevel definition within a block
-    let
-        vmod, res = @analyze_toplevel2 begin
-            begin
-                struct Foo
-                    bar
+    @testset "toplevel definitions within a block" begin
+        let
+            vmod, res = @analyze_toplevel2 begin
+                begin
+                    struct Foo
+                        bar
+                    end
+
+                    foo = Foo(:bar)
+                    println(foo)
                 end
-
-                foo = Foo(:bar)
-                println(foo)
             end
+            @test is_concrete(vmod, :Foo)
+            @test is_analyzed(vmod, :foo)
+            @test isa_analyzed(vmod.foo, vmod.Foo)
         end
-        @test is_concrete(vmod, :Foo)
-        @test is_analyzed(vmod, :foo)
-        @test isa_analyzed(vmod.foo, vmod.Foo)
-    end
 
-    # toplevel definitions within a block
-    # somewhat related upstream issue: https://github.com/JuliaDebug/LoweredCodeUtils.jl/issues/47
-    # well, the actual error here is world age error ...
-    let
-        vmod, res = @analyze_toplevel2 begin
-            begin
-                abstract type Foo end
-                struct Foo1 <: Foo
-                    foo
+        let
+            vmod, res = @analyze_toplevel2 begin
+                begin
+                    abstract type Foo end
+                    struct Foo1 <: Foo
+                        foo
+                    end
+
+                    foo = Foo1(:foo)
+                    println(foo)
                 end
-
-                foo = Foo1(:foo)
-                println(foo)
             end
+            @test isempty(res.toplevel_error_reports)
+            @test is_analyzed(vmod, :foo)
+            @test isa_analyzed(vmod.foo, vmod.Foo1)
         end
-        @test isempty(res.toplevel_error_reports)
-        @test is_analyzed(vmod, :foo)
-        @test isa_analyzed(vmod.foo, vmod.Foo1)
+
+        let
+            vmod, res = @analyze_toplevel2 begin
+                begin
+                    import Base: getproperty
+                    struct Foo
+                        bar
+                    end
+                    getproperty(foo::Foo, sym::Symbol) =
+                        sym === :baz ? getfield(foo, :bar) : getfield(foo, :bar)
+                end
+                bar = Foo(gensym()).baz
+            end
+
+            @test isempty(res.toplevel_error_reports)
+            @test is_analyzed(vmod, :Foo)
+            @test is_abstract(vmod, :bar)
+        end
+
+        let
+            vmod, res = mktemp() do path, io
+                write(io, quote
+                    struct Foo
+                        bar
+                    end
+                end |> string)
+                flush(io)
+
+                @eval @analyze_toplevel2 begin
+                    begin
+                        include($path)
+                        getbar(foo::Foo) = foo.bar
+                    end
+                    bar = getbar(Foo(gensym()))
+                end
+            end
+
+            @test isempty(res.toplevel_error_reports)
+            @test is_analyzed(vmod, :Foo)
+            @test is_analyzed(vmod, :bar)
+        end
     end
 end
 
@@ -444,7 +483,7 @@ end
 @testset "handle `include`" begin
     let
         f1 = normpath(FIXTURE_DIR, "include1.jl")
-        f2 = normpath(FIXTURE_DIR, "include1.jl")
+        f2 = normpath(FIXTURE_DIR, "include2.jl")
 
         context = gen_virtual_module(@__MODULE__)
         res = report_file2(f1; context, virtualize = false).res
@@ -492,6 +531,77 @@ end
             @test f2 in report.files
             @test report.file == f2
             @test report.line == 1
+        end
+    end
+
+    let
+        modf = normpath(FIXTURE_DIR, "modinclude.jl")
+        inc2 = normpath(FIXTURE_DIR, "include2.jl")
+
+        context = gen_virtual_module(@__MODULE__)
+        res = report_file2(modf; context, virtualize=false).res
+
+        @test modf in res.included_files
+        @test inc2 in res.included_files
+        @test isempty(res.toplevel_error_reports)
+        @test isempty(res.inference_error_reports)
+        @test is_concrete(context.Outer, :foo)
+    end
+
+    # bad includes
+    # ------------
+
+    let res = @analyze_toplevel begin
+            include(Symbol("somefile.jl"))
+        end
+        @test length(res.toplevel_error_reports) == 1
+        report = res.toplevel_error_reports[1]
+        @test report isa ActualErrorWrapped
+        err = report.err
+        @test err isa MethodError
+    end
+    let res = @analyze_toplevel begin
+            module __xxx__ end
+            Base.include("somefile.jl", __xxx__)
+        end
+        @test length(res.toplevel_error_reports) == 1
+        report = res.toplevel_error_reports[1]
+        @test report isa ActualErrorWrapped
+        err = report.err
+        @test err isa MethodError
+        @test err.f === Base.include
+    end
+    let res = @analyze_toplevel begin
+            module __xxx__ end
+            Core.include("somefile.jl", __xxx__)
+        end
+        @test length(res.toplevel_error_reports) == 1
+        report = res.toplevel_error_reports[1]
+        @test report isa ActualErrorWrapped
+        err = report.err
+        @test err isa MethodError
+        @test err.f === Core.include
+    end
+    let res = @analyze_toplevel begin
+            module __xxx__ end
+            Base.include(__xxx__, Symbol("somefile.jl"))
+        end
+        @test length(res.toplevel_error_reports) == 1
+        report = res.toplevel_error_reports[1]
+        @test report isa ActualErrorWrapped
+        err = report.err
+        @test err isa MethodError
+    end
+
+    # unsupported features
+    # --------------------
+
+    let res = @test_logs (:warn,) @analyze_toplevel begin
+            function mymapexpr(x::Expr)
+                println(x)
+                nothing
+            end
+            include(mymapexpr, "somefile.jl")
         end
     end
 end
